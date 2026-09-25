@@ -10,9 +10,35 @@
  *   clear, actionable error instead of failing silently.
  */
 
+import { createRequire } from "node:module";
+
 export const LL2_BASE = "https://ll.thespacedevs.com/2.2.0";
 export const SPACEX_BASE = "https://api.spacexdata.com/v5";
-const USER_AGENT = "space-launch-mcp/0.1.0 (+https://github.com/romualdoag/space-launch-mcp)";
+
+const _require = createRequire(import.meta.url);
+let _pkgVersion = "0.0.0";
+try {
+  const pkg = _require("../package.json") as { version?: unknown };
+  if (typeof pkg.version === "string" && pkg.version.length > 0) _pkgVersion = pkg.version;
+} catch {
+  /* fallback quando package.json não é resolvível (ex. bundle) */
+}
+export const PKG_VERSION = _pkgVersion;
+export const USER_AGENT = `space-launch-mcp/${_pkgVersion} (+https://github.com/romualdoag/space-launch-mcp)`;
+
+/** Timeout por requisição (ms). Configurável via SPACE_LAUNCH_TIMEOUT_MS (1..60000). Padrão 12s. */
+export function getTimeoutMs(): number {
+  const raw = process.env.SPACE_LAUNCH_TIMEOUT_MS;
+  if (raw !== undefined && raw !== "") {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return Math.min(Math.floor(n), 60_000);
+  }
+  return 12_000;
+}
+
+function warn(msg: string): void {
+  console.error(`[space-launch-mcp] ${msg}`);
+}
 
 // ---------------------------------------------------------------------------
 // HTTP + cache
@@ -25,6 +51,7 @@ type FetchFn = (
   ok: boolean;
   status: number;
   statusText?: string;
+  headers?: { get(name: string): string | null } | Record<string, string | null | undefined>;
   json(): Promise<unknown>;
 }>;
 
@@ -54,35 +81,122 @@ export function __resetFetch(): void {
 
 type CacheEntry = { expires: number; data: unknown };
 const cache = new Map<string, CacheEntry>();
+const CACHE_MAX = 200;
+
+function cacheGet(key: string): CacheEntry | undefined {
+  const hit = cache.get(key);
+  if (!hit) return undefined;
+  if (hit.expires <= Date.now()) {
+    cache.delete(key);
+    return undefined;
+  }
+  // Refresh LRU: re-insere para marcar como recente.
+  cache.delete(key);
+  cache.set(key, hit);
+  return hit;
+}
+
+function cacheSet(key: string, entry: CacheEntry): void {
+  if (cache.has(key)) cache.delete(key);
+  else if (cache.size >= CACHE_MAX) {
+    const oldest = cache.keys().next();
+    if (!oldest.done) cache.delete(oldest.value);
+  }
+  cache.set(key, entry);
+}
+
+/** Tamanho atual do cache (usado em testes). */
+export function __cacheSize(): number {
+  return cache.size;
+}
 
 /** Clear the response cache (used by unit tests). */
 export function __clearCache(): void {
   cache.clear();
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function getHeader(headers: unknown, name: string): string | null {
+  if (!headers) return null;
+  if (typeof (headers as { get?: unknown }).get === "function") {
+    try {
+      return (headers as { get(n: string): string | null }).get(name);
+    } catch {
+      return null;
+    }
+  }
+  const rec = headers as Record<string, unknown>;
+  for (const k of Object.keys(rec)) {
+    if (k.toLowerCase() === name.toLowerCase()) {
+      const v = rec[k];
+      return typeof v === "string" ? v : v == null ? null : String(v);
+    }
+  }
+  return null;
+}
+
+/** Retry-After (s ou data HTTP) → ms, ou null se ausente/inválido. Cap 30s. */
+function parseRetryAfterMs(v: string | null): number | null {
+  if (!v) return null;
+  const t = v.trim();
+  if (/^\d+$/.test(t)) return Math.min(Number(t) * 1000, 30_000);
+  const ts = Date.parse(t);
+  if (Number.isFinite(ts)) return Math.max(0, Math.min(ts - Date.now(), 30_000));
+  return null;
+}
+
+const MAX_RETRIES = 2;
+const RETRY_BASE_MS = 500;
+
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || status === 502 || status === 503 || status === 504;
+}
+
 async function fetchJson<T>(url: string, label: string, ttlMs: number, init?: { method?: string; body?: string }): Promise<T> {
   const key = `${init?.method ?? "GET"} ${url} ${init?.body ?? ""}`;
   const now = Date.now();
-  const hit = cache.get(key);
+  const hit = cacheGet(key);
   if (hit && hit.expires > now) return hit.data as T;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 25_000);
-  try {
-    const resp = await fetchFn(url, {
-      method: init?.method,
-      headers: init?.body ? { "content-type": "application/json" } : undefined,
-      body: init?.body,
-      signal: ctrl.signal,
-    });
-    if (!resp.ok) {
-      throw new Error(`${label}: HTTP ${resp.status} for ${url}`);
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const timeoutMs = getTimeoutMs();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const resp = await fetchFn(url, {
+        method: init?.method,
+        headers: init?.body ? { "content-type": "application/json" } : undefined,
+        body: init?.body,
+        signal: ctrl.signal,
+      });
+      if (isRetryableStatus(resp.status) && attempt < MAX_RETRIES) {
+        const delay = parseRetryAfterMs(getHeader(resp.headers, "retry-after")) ?? RETRY_BASE_MS * 2 ** attempt;
+        warn(`${label}: HTTP ${resp.status} — retry ${attempt + 1}/${MAX_RETRIES} em ${delay}ms (${url})`);
+        await sleep(delay);
+        continue;
+      }
+      if (!resp.ok) {
+        throw new Error(`${label}: HTTP ${resp.status} for ${url}`);
+      }
+      const data = (await resp.json()) as T;
+      cacheSet(key, { expires: Date.now() + ttlMs, data });
+      return data;
+    } catch (err) {
+      lastError = err;
+      if (err instanceof Error && err.name === "AbortError") {
+        warn(`${label}: timeout após ${getTimeoutMs()}ms (${url})`);
+        throw new Error(`${label}: timeout após ${getTimeoutMs()}ms for ${url}`);
+      }
+      // Erro HTTP (incl. 429/5xx após esgotar retries) ou parse: não re-tenta fora do loop.
+      throw err;
+    } finally {
+      clearTimeout(timer);
     }
-    const data = (await resp.json()) as T;
-    cache.set(key, { expires: now + ttlMs, data });
-    return data;
-  } finally {
-    clearTimeout(timer);
   }
+  throw lastError instanceof Error ? lastError : new Error(`${label}: request failed for ${url}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -165,7 +279,17 @@ export function clampOffset(offset: number | undefined): number {
 }
 
 function isIsoDateLike(s: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}([T ].*)?$/.test(s.trim());
+  const t = s.trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})([T ].*)?$/.exec(t);
+  if (!m) return false;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+  // Valida dia real (ex. rejeita 2026-02-30, 2026-13-01, 2025-02-29).
+  const dim = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  if (d > dim) return false;
+  return Number.isFinite(Date.parse(t.replace(" ", "T")));
 }
 
 /** Validate user-supplied date filters early with a clear message. */
@@ -321,11 +445,23 @@ async function resolveLocationIds(countryCode: string): Promise<number[]> {
       `Invalid country_code '${countryCode}'. Use ISO 3166-1 alpha-3, e.g. 'USA', 'BRA', 'JPN', 'FRA'.`,
     );
   }
-  const url = `${LL2_BASE}/location/?country_code=${encodeURIComponent(code)}&limit=100`;
-  const data = await fetchJson<Paginated<Record<string, unknown>>>(url, "LL2 locations", 24 * 3_600_000);
-  return (Array.isArray(data.results) ? data.results : [])
-    .map((r) => Number(r.id))
-    .filter((n) => Number.isFinite(n));
+  // Pagina via `next` — países grandes (ex. USA) têm >100 locations.
+  let url: string | null = `${LL2_BASE}/location/?country_code=${encodeURIComponent(code)}&limit=100`;
+  const ids: number[] = [];
+  for (let page = 0; page < 20 && url; page++) {
+    const pageUrl: string = url;
+    const data: Paginated<Record<string, unknown>> = await fetchJson<Paginated<Record<string, unknown>>>(
+      pageUrl,
+      "LL2 locations",
+      24 * 3_600_000,
+    );
+    for (const r of Array.isArray(data.results) ? data.results : []) {
+      const n = Number((r as Record<string, unknown>).id);
+      if (Number.isFinite(n)) ids.push(n);
+    }
+    url = typeof data.next === "string" && data.next.length > 0 ? data.next : null;
+  }
+  return ids;
 }
 
 async function resolveProviderId(providerName: string): Promise<number> {
@@ -344,27 +480,44 @@ async function resolveProviderId(providerName: string): Promise<number> {
 export async function listUpcomingLaunches(opts: UpcomingOptions = {}) {
   const mode: UpcomingMode = opts.mode === "previous" ? "previous" : "upcoming";
   const resolved: { locationIds?: number[]; providerId?: number } = {};
-  if (opts.countryCode && opts.locationId === undefined) {
-    const ids = await resolveLocationIds(opts.countryCode);
-    if (ids.length === 0) {
+  let conflictNote: string | undefined;
+  if (opts.countryCode && opts.locationId !== undefined) {
+    // location_id explícito vence; country_code seria contraditório se aplicado junto.
+    conflictNote =
+      `Both country_code ('${opts.countryCode.toUpperCase()}') and location_id (${opts.locationId}) were given; ` +
+      `location_id takes precedence and country_code was ignored.`;
+    warn(conflictNote);
+  }
+  // Resolve em paralelo: antes eram 2 round-trips sequenciais + launch (3×25s no pior caso).
+  const needLocations = opts.countryCode && opts.locationId === undefined;
+  const needProvider = opts.providerName && opts.providerId === undefined;
+  const [locationIds, providerId] = await Promise.all([
+    needLocations ? resolveLocationIds(opts.countryCode as string) : Promise.resolve(undefined),
+    needProvider ? resolveProviderId(opts.providerName as string) : Promise.resolve(undefined),
+  ]);
+  if (locationIds) {
+    if (locationIds.length === 0) {
       return {
         mode,
         count: 0,
         results: [],
-        note: `No launch locations registered in LL2 for country '${opts.countryCode.toUpperCase()}'.`,
+        note: `No launch locations registered in LL2 for country '${(opts.countryCode as string).toUpperCase()}'.`,
       };
     }
-    resolved.locationIds = ids;
+    resolved.locationIds = locationIds;
   }
-  if (opts.providerName && opts.providerId === undefined) {
-    resolved.providerId = await resolveProviderId(opts.providerName);
-  }
+  if (providerId !== undefined) resolved.providerId = providerId;
   const params = buildLaunchParams({ ...opts, mode }, resolved);
   const qs = new URLSearchParams(params).toString();
   const url = `${LL2_BASE}/launch/${mode}/?${qs}`;
   const data = await fetchJson<Paginated<Record<string, unknown>>>(url, `LL2 ${mode} launches`, 60_000);
   const results = Array.isArray(data.results) ? data.results.map(normalizeLaunch) : [];
-  return { mode, count: typeof data.count === "number" ? data.count : results.length, results };
+  return {
+    mode,
+    count: typeof data.count === "number" ? data.count : results.length,
+    results,
+    ...(conflictNote ? { note: conflictNote } : {}),
+  };
 }
 
 export async function getLaunch(id: string) {
@@ -440,8 +593,16 @@ export async function listSpaceXLaunches(opts: { upcoming?: boolean; search?: st
     const q = opts.search.trim().toLowerCase();
     slim = slim.filter((r) => String(r.name ?? "").toLowerCase().includes(q));
   }
-  slim.sort((a, b) => String(a.dateUtc ?? "").localeCompare(String(b.dateUtc ?? "")));
-  if (!upcoming) slim.reverse();
+  slim.sort((a, b) => {
+    // Datas ausentes sempre por último, em ambas as direções.
+    const da = typeof a.dateUtc === "string" && a.dateUtc.length > 0 ? a.dateUtc : null;
+    const db = typeof b.dateUtc === "string" && b.dateUtc.length > 0 ? b.dateUtc : null;
+    if (da === null && db === null) return 0;
+    if (da === null) return 1;
+    if (db === null) return -1;
+    const cmp = da.localeCompare(db);
+    return upcoming ? cmp : -cmp;
+  });
   return { upcoming, count: slim.length, results: slim.slice(0, limit) };
 }
 

@@ -17,11 +17,12 @@ import {
   listLaunchProviders,
   listSpaceXLaunches,
   getSpaceXLaunch,
+  PKG_VERSION,
 } from "./service.js";
 
 const server = new McpServer({
   name: "space-launch-mcp",
-  version: "0.1.0",
+  version: PKG_VERSION,
 });
 
 type TextResult = {

@@ -41,11 +41,17 @@ Exemplos de perguntas que o MCP responde:
 mcp_servers:
   space-launch:
     command: node
-    args: [/home/hermes/space-launch-mcp/dist/index.js]
+    args: [/home/hermes/github/space-launch-mcp/dist/index.js]
     enabled: true
 ```
 
 Depois reinicie o gateway Hermes.
+
+## Configuração
+
+- `SPACE_LAUNCH_TIMEOUT_MS` — timeout por requisição HTTP em ms (padrão `12000`, máx. `60000`).
+  Avisos (timeout, retries 429/5xx, `country_code` ignorado quando `location_id` é dado)
+  vão para stderr com prefixo `[space-launch-mcp]`.
 
 ## Licença
 
