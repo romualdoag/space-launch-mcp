@@ -89,12 +89,14 @@ const EXPECTED_TOOLS = [
   "list_launch_locations",
   "list_launch_pads",
   "list_launch_providers",
+  "list_rocketlaunch_live",
+  "list_spaceflight_news",
   "list_spacex_launches",
   "list_upcoming_launches",
 ];
 
 describe("MCP protocol", () => {
-  it("handshake + tools/list exposes the 7 tools", async () => {
+  it("handshake + tools/list exposes the 9 tools", async () => {
     const msgs = await sendReceive([INIT, INITIALIZED, { jsonrpc: "2.0", id: 2, method: "tools/list" }]);
     const list = msgs.find((m) => m.id === 2);
     expect(list?.error).toBeUndefined();
@@ -114,6 +116,8 @@ describe("MCP protocol", () => {
       },
     ]);
     const call = msgs.find((m) => m.id === 3);
+    // Erros de validação voltam como resultado estruturado (isError), não como JSON-RPC error.
+    expect(call?.result?.isError).toBe(true);
     const text: string =
       call?.error?.message ?? call?.result?.content?.[0]?.text ?? JSON.stringify(call);
     expect(text).toMatch(/window_start_gte|ISO/);
@@ -131,6 +135,7 @@ describe("MCP protocol", () => {
       },
     ]);
     const call = msgs.find((m) => m.id === 4);
+    expect(call?.result?.isError).toBe(true);
     const text: string =
       call?.error?.message ?? call?.result?.content?.[0]?.text ?? JSON.stringify(call);
     expect(text).toMatch(/alpha-3/);

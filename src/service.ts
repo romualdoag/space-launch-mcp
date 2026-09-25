@@ -14,6 +14,16 @@ import { createRequire } from "node:module";
 
 export const LL2_BASE = "https://ll.thespacedevs.com/2.2.0";
 export const SPACEX_BASE = "https://api.spacexdata.com/v5";
+/** RocketLaunch.Live free JSON (próximos 5 lançamentos, sem auth). */
+export const RLL_BASE = "https://fdo.rocketlaunch.live";
+/** Spaceflight News API v4 (TheSpaceDevs) — notícias, sem auth. */
+export const SFN_BASE = "https://api.spaceflightnewsapi.net/v4";
+
+/** Chave opcional RocketLaunch.Live (plano Premium libera o catálogo completo). */
+export function getRllApiKey(): string | null {
+  const k = (process.env.RLL_API_KEY ?? "").trim();
+  return k.length > 0 ? k : null;
+}
 
 const _require = createRequire(import.meta.url);
 let _pkgVersion = "0.0.0";
@@ -264,6 +274,32 @@ export type SlimProvider = {
   countryCode: string | null;
 };
 
+export type SlimRllLaunch = {
+  id: number | null;
+  name: string;
+  provider: string | null;
+  vehicle: string | null;
+  pad: string | null;
+  location: string | null;
+  country: string | null;
+  t0: string | null;
+  windowOpen: string | null;
+  dateStr: string | null;
+  description: string | null;
+  url: string | null;
+};
+
+export type SpaceflightNewsType = "article" | "blog" | "report";
+
+export type SlimNewsItem = {
+  id: number;
+  title: string;
+  url: string | null;
+  newsSite: string | null;
+  summary: string | null;
+  publishedAt: string | null;
+};
+
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested offline)
 // ---------------------------------------------------------------------------
@@ -308,6 +344,17 @@ export function assertValidWindow(opts: Pick<UpcomingOptions, "windowStartGte" |
 
 function str(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+/** Normaliza e valida ISO 3166-1 alpha-3 (ex. 'usa' → 'USA'). Lança erro claro se inválido. */
+export function validateCountryCode(input: string): string {
+  const code = input.trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(code)) {
+    throw new Error(
+      `Invalid country_code '${input}'. Use ISO 3166-1 alpha-3, e.g. 'USA', 'BRA', 'JPN', 'FRA'.`,
+    );
+  }
+  return code;
 }
 
 function num(v: unknown): number | null {
@@ -416,6 +463,41 @@ export function pickProvider(
   return prefix ?? results[0];
 }
 
+/** Slim down one raw RocketLaunch.Live launch row (no I/O). */
+export function normalizeRllLaunch(raw: Record<string, unknown>): SlimRllLaunch {
+  const r = raw as Record<string, unknown>;
+  const provider = (r.provider ?? {}) as Record<string, unknown>;
+  const vehicle = (r.vehicle ?? {}) as Record<string, unknown>;
+  const pad = (r.pad ?? {}) as Record<string, unknown>;
+  const location = (pad.location ?? {}) as Record<string, unknown>;
+  return {
+    id: num(r.id),
+    name: String(r.name ?? "Unnamed launch"),
+    provider: str(provider.name),
+    vehicle: str(vehicle.name),
+    pad: str(pad.name),
+    location: str(location.name),
+    country: str(location.country),
+    t0: str(r.t0),
+    windowOpen: str(r.win_open),
+    dateStr: str(r.date_str),
+    description: str(r.launch_description) ?? str(r.mission_description),
+    url: str(r.slug) ? `https://rocketlaunch.live/launch/${String(r.slug)}` : null,
+  };
+}
+
+/** Slim down one raw Spaceflight News v4 item (no I/O). */
+export function normalizeNewsItem(raw: Record<string, unknown>): SlimNewsItem {
+  return {
+    id: Number(raw.id),
+    title: String(raw.title ?? "Untitled"),
+    url: str(raw.url),
+    newsSite: str(raw.news_site),
+    summary: str(raw.summary),
+    publishedAt: str(raw.published_at),
+  };
+}
+
 /** Slim down one raw SpaceX v5 launch (no I/O). */
 export function normalizeSpaceXLaunch(raw: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -439,12 +521,7 @@ export function normalizeSpaceXLaunch(raw: Record<string, unknown>): Record<stri
 type Paginated<T> = { count: number; next: string | null; results: T[] };
 
 async function resolveLocationIds(countryCode: string): Promise<number[]> {
-  const code = countryCode.trim().toUpperCase();
-  if (!/^[A-Z]{3}$/.test(code)) {
-    throw new Error(
-      `Invalid country_code '${countryCode}'. Use ISO 3166-1 alpha-3, e.g. 'USA', 'BRA', 'JPN', 'FRA'.`,
-    );
-  }
+  const code = validateCountryCode(countryCode);
   // Pagina via `next` — países grandes (ex. USA) têm >100 locations.
   let url: string | null = `${LL2_BASE}/location/?country_code=${encodeURIComponent(code)}&limit=100`;
   const ids: number[] = [];
@@ -528,41 +605,58 @@ export async function getLaunch(id: string) {
   return normalizeLaunch(data);
 }
 
-export async function listLaunchLocations(opts: { search?: string; countryCode?: string; limit?: number } = {}) {
-  const params: Record<string, string> = { limit: String(clampLimit(opts.limit, 10)) };
+export async function listLaunchLocations(
+  opts: { search?: string; countryCode?: string; limit?: number; offset?: number } = {},
+) {
+  const params: Record<string, string> = {
+    limit: String(clampLimit(opts.limit, 10)),
+    offset: String(clampOffset(opts.offset)),
+  };
   if (opts.search) params.search = opts.search;
-  if (opts.countryCode) {
-    const code = opts.countryCode.trim().toUpperCase();
-    if (!/^[A-Z]{3}$/.test(code)) {
-      throw new Error(
-        `Invalid country_code '${opts.countryCode}'. Use ISO 3166-1 alpha-3, e.g. 'USA', 'BRA', 'JPN', 'FRA'.`,
-      );
-    }
-    params.country_code = code;
-  }
+  if (opts.countryCode) params.country_code = validateCountryCode(opts.countryCode);
   const url = `${LL2_BASE}/location/?${new URLSearchParams(params).toString()}`;
   const data = await fetchJson<Paginated<Record<string, unknown>>>(url, "LL2 locations", 24 * 3_600_000);
   const results = Array.isArray(data.results) ? data.results.map(normalizeLocation) : [];
-  return { count: typeof data.count === "number" ? data.count : results.length, results };
+  return {
+    count: typeof data.count === "number" ? data.count : results.length,
+    offset: clampOffset(opts.offset),
+    results,
+  };
 }
 
-export async function listLaunchPads(opts: { search?: string; locationId?: number; limit?: number } = {}) {
-  const params: Record<string, string> = { limit: String(clampLimit(opts.limit, 10)) };
+export async function listLaunchPads(
+  opts: { search?: string; locationId?: number; limit?: number; offset?: number } = {},
+) {
+  const params: Record<string, string> = {
+    limit: String(clampLimit(opts.limit, 10)),
+    offset: String(clampOffset(opts.offset)),
+  };
   if (opts.search) params.search = opts.search;
   if (opts.locationId !== undefined) params.location__ids = String(opts.locationId);
   const url = `${LL2_BASE}/pad/?${new URLSearchParams(params).toString()}`;
   const data = await fetchJson<Paginated<Record<string, unknown>>>(url, "LL2 pads", 24 * 3_600_000);
   const results = Array.isArray(data.results) ? data.results.map(normalizePad) : [];
-  return { count: typeof data.count === "number" ? data.count : results.length, results };
+  return {
+    count: typeof data.count === "number" ? data.count : results.length,
+    offset: clampOffset(opts.offset),
+    results,
+  };
 }
 
-export async function listLaunchProviders(opts: { search?: string; limit?: number } = {}) {
-  const params: Record<string, string> = { limit: String(clampLimit(opts.limit, 10)) };
+export async function listLaunchProviders(opts: { search?: string; limit?: number; offset?: number } = {}) {
+  const params: Record<string, string> = {
+    limit: String(clampLimit(opts.limit, 10)),
+    offset: String(clampOffset(opts.offset)),
+  };
   if (opts.search) params.search = opts.search;
   const url = `${LL2_BASE}/agencies/?${new URLSearchParams(params).toString()}`;
   const data = await fetchJson<Paginated<Record<string, unknown>>>(url, "LL2 agencies", 24 * 3_600_000);
   const results = Array.isArray(data.results) ? data.results.map(normalizeProvider) : [];
-  return { count: typeof data.count === "number" ? data.count : results.length, results };
+  return {
+    count: typeof data.count === "number" ? data.count : results.length,
+    offset: clampOffset(opts.offset),
+    results,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -577,24 +671,52 @@ function spaceXError(action: string, err: unknown): never {
   );
 }
 
-export async function listSpaceXLaunches(opts: { upcoming?: boolean; search?: string; limit?: number } = {}) {
+export async function listSpaceXLaunches(
+  opts: { upcoming?: boolean; search?: string; limit?: number; offset?: number } = {},
+) {
   const upcoming = opts.upcoming ?? true;
   const limit = clampLimit(opts.limit, 10);
-  const url = `${SPACEX_BASE}/launches/${upcoming ? "upcoming" : "past"}`;
-  let rows: Record<string, unknown>[];
+  const offset = clampOffset(opts.offset);
+  // Query server-side via POST /launches/query (paginado, com regex + sort no servidor).
+  const body = JSON.stringify({
+    query: {
+      upcoming,
+      ...(opts.search?.trim()
+        ? { name: { $regex: opts.search.trim(), $options: "i" } }
+        : {}),
+    },
+    options: {
+      limit,
+      offset,
+      sort: { date_utc: upcoming ? "asc" : "desc" },
+    },
+  });
+  let payload: unknown;
   try {
-    const data = await fetchJson<Record<string, unknown>[]>(url, "SpaceX launches", 5 * 60_000);
-    rows = Array.isArray(data) ? data : [];
+    payload = await fetchJson<unknown>(`${SPACEX_BASE}/launches/query`, "SpaceX launches", 5 * 60_000, {
+      method: "POST",
+      body,
+    });
   } catch (err) {
     spaceXError("list_spacex_launches", err);
   }
-  let slim = rows!.map(normalizeSpaceXLaunch);
-  if (opts.search) {
-    const q = opts.search.trim().toLowerCase();
-    slim = slim.filter((r) => String(r.name ?? "").toLowerCase().includes(q));
+  let rows: Record<string, unknown>[];
+  let total: number | null = null;
+  if (Array.isArray(payload)) {
+    // Formato legado (GET /upcoming|past): mantém filtro/ordenação local como fallback.
+    rows = payload as Record<string, unknown>[];
+    if (opts.search) {
+      const q = opts.search.trim().toLowerCase();
+      rows = rows.filter((r) => String(r.name ?? "").toLowerCase().includes(q));
+    }
+  } else {
+    const page = (payload ?? {}) as Record<string, unknown>;
+    rows = Array.isArray(page.docs) ? (page.docs as Record<string, unknown>[]) : [];
+    total = typeof page.totalDocs === "number" ? page.totalDocs : null;
   }
+  const slim = rows.map(normalizeSpaceXLaunch);
   slim.sort((a, b) => {
-    // Datas ausentes sempre por último, em ambas as direções.
+    // Datas ausentes sempre por último (a API pode retorná-las primeiro).
     const da = typeof a.dateUtc === "string" && a.dateUtc.length > 0 ? a.dateUtc : null;
     const db = typeof b.dateUtc === "string" && b.dateUtc.length > 0 ? b.dateUtc : null;
     if (da === null && db === null) return 0;
@@ -603,7 +725,7 @@ export async function listSpaceXLaunches(opts: { upcoming?: boolean; search?: st
     const cmp = da.localeCompare(db);
     return upcoming ? cmp : -cmp;
   });
-  return { upcoming, count: slim.length, results: slim.slice(0, limit) };
+  return { upcoming, count: total ?? slim.length, offset, results: slim.slice(0, limit) };
 }
 
 export async function getSpaceXLaunch(id: string) {
@@ -616,4 +738,71 @@ export async function getSpaceXLaunch(id: string) {
   } catch (err) {
     spaceXError("get_spacex_launch", err);
   }
+}
+
+// ---------------------------------------------------------------------------
+// RocketLaunch.Live (fonte terciária — fallback independente do LL2)
+// Endpoint gratuito: GET /json/launches/next/5 (sem auth, máx. 5 itens).
+// Com RLL_API_KEY (Premium), a chave é anexada como ?key= para o catálogo completo.
+// ---------------------------------------------------------------------------
+
+export async function listRocketLaunchLiveUpcoming(opts: { limit?: number } = {}) {
+  // O tier gratuito serve no máximo os próximos 5 lançamentos.
+  const limit = Math.min(clampLimit(opts.limit, 5), 5);
+  const key = getRllApiKey();
+  const url =
+    `${RLL_BASE}/json/launches/next/${limit}` + (key ? `?key=${encodeURIComponent(key)}` : "");
+  let payload: Record<string, unknown>;
+  try {
+    payload = await fetchJson<Record<string, unknown>>(url, "RocketLaunch.Live launches", 5 * 60_000);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    warn(`RocketLaunch.Live indisponível (${detail}) — use list_upcoming_launches (Launch Library 2).`);
+    throw new Error(
+      `RocketLaunch.Live unavailable (${detail}). ` +
+        `It is a fallback source — use list_upcoming_launches (Launch Library 2) instead.`,
+    );
+  }
+  const raw = payload.result ?? payload.results ?? [];
+  const rows = Array.isArray(raw) ? (raw as Record<string, unknown>[]) : [];
+  const results = rows.map(normalizeRllLaunch).slice(0, limit);
+  return { source: "rocketlaunch.live", count: results.length, results };
+}
+
+// ---------------------------------------------------------------------------
+// Spaceflight News API v4 (TheSpaceDevs) — contexto noticioso, sem auth
+// ---------------------------------------------------------------------------
+
+const SFN_PATHS: Record<SpaceflightNewsType, string> = {
+  article: "articles",
+  blog: "blogs",
+  report: "reports",
+};
+
+export async function listSpaceflightNews(
+  opts: { type?: SpaceflightNewsType; search?: string; limit?: number; offset?: number } = {},
+) {
+  const type: SpaceflightNewsType =
+    opts.type === "blog" || opts.type === "report" ? opts.type : "article";
+  const params: Record<string, string> = {
+    limit: String(clampLimit(opts.limit, 10)),
+    offset: String(clampOffset(opts.offset)),
+  };
+  if (opts.search?.trim()) params.search = opts.search.trim();
+  const url = `${SFN_BASE}/${SFN_PATHS[type]}/?${new URLSearchParams(params).toString()}`;
+  let data: Paginated<Record<string, unknown>>;
+  try {
+    data = await fetchJson<Paginated<Record<string, unknown>>>(url, "Spaceflight News", 5 * 60_000);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    warn(`Spaceflight News indisponível (${detail}).`);
+    throw new Error(`Spaceflight News unavailable (${detail}). Retry later.`);
+  }
+  const results = Array.isArray(data.results) ? data.results.map(normalizeNewsItem) : [];
+  return {
+    type,
+    count: typeof data.count === "number" ? data.count : results.length,
+    offset: clampOffset(opts.offset),
+    results,
+  };
 }

@@ -5,6 +5,8 @@
  * Primary source: Launch Library 2 (global manifest — SpaceX, Rocket Lab,
  * Arianespace, ISRO, CNSA…), no credentials needed.
  * Secondary source: SpaceX REST API v5 (SpaceX-specific detail).
+ * Tertiary/fallback: RocketLaunch.Live free JSON (next 5 launches, no key).
+ * Context: Spaceflight News API v4 (articles/blogs/reports, no key).
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -17,6 +19,8 @@ import {
   listLaunchProviders,
   listSpaceXLaunches,
   getSpaceXLaunch,
+  listRocketLaunchLiveUpcoming,
+  listSpaceflightNews,
   PKG_VERSION,
 } from "./service.js";
 
@@ -27,12 +31,31 @@ const server = new McpServer({
 
 type TextResult = {
   content: [{ type: "text"; text: string }];
+  isError?: boolean;
 };
 
 function asText(obj: unknown): TextResult {
   return {
     content: [{ type: "text", text: JSON.stringify(obj, null, 2) }],
   };
+}
+
+function asError(err: unknown): TextResult {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(`[space-launch-mcp] tool error: ${msg}`);
+  return {
+    content: [{ type: "text", text: `Error: ${msg}` }],
+    isError: true,
+  };
+}
+
+/** Executa a tool com erro estruturado (isError) em vez de derrubar a sessão. */
+async function handle(fn: () => Promise<unknown>): Promise<TextResult> {
+  try {
+    return asText(await fn());
+  } catch (err) {
+    return asError(err);
+  }
 }
 
 const limitParam = z
@@ -42,6 +65,8 @@ const limitParam = z
   .max(100)
   .optional()
   .describe("Max items to return (default 10, max 100).");
+
+const offsetParam = z.number().int().min(0).optional().describe("Pagination offset (default 0).");
 
 server.registerTool(
   "list_upcoming_launches",
@@ -63,8 +88,8 @@ server.registerTool(
     },
   },
   async (args) =>
-    asText(
-      await listUpcomingLaunches({
+    handle(() =>
+      listUpcomingLaunches({
         search: args.search,
         windowStartGte: args.window_start_gte,
         windowStartLte: args.window_start_lte,
@@ -88,7 +113,7 @@ server.registerTool(
       id: z.string().describe("LL2 launch id (uuid) or slug."),
     },
   },
-  async ({ id }) => asText(await getLaunch(id)),
+  async ({ id }) => handle(() => getLaunch(id)),
 );
 
 server.registerTool(
@@ -99,14 +124,16 @@ server.registerTool(
       search: z.string().optional().describe("Free-text search, e.g. 'Cape', 'Kourou', 'Tanegashima'."),
       country_code: z.string().optional().describe("ISO 3166-1 alpha-3, e.g. 'USA', 'FRA', 'JPN', 'KAZ'."),
       limit: limitParam,
+      offset: offsetParam,
     },
   },
   async (args) =>
-    asText(
-      await listLaunchLocations({
+    handle(() =>
+      listLaunchLocations({
         search: args.search,
         countryCode: args.country_code,
         limit: args.limit,
+        offset: args.offset,
       }),
     ),
 );
@@ -119,14 +146,16 @@ server.registerTool(
       search: z.string().optional().describe("Free-text search, e.g. 'LC-39A', 'Ariane'."),
       location_id: z.number().int().positive().optional().describe("Parent LL2 location id."),
       limit: limitParam,
+      offset: offsetParam,
     },
   },
   async (args) =>
-    asText(
-      await listLaunchPads({
+    handle(() =>
+      listLaunchPads({
         search: args.search,
         locationId: args.location_id,
         limit: args.limit,
+        offset: args.offset,
       }),
     ),
 );
@@ -138,25 +167,28 @@ server.registerTool(
     inputSchema: {
       search: z.string().optional().describe("Free-text search, e.g. 'SpaceX'."),
       limit: limitParam,
+      offset: offsetParam,
     },
   },
-  async (args) => asText(await listLaunchProviders({ search: args.search, limit: args.limit })),
+  async (args) =>
+    handle(() => listLaunchProviders({ search: args.search, limit: args.limit, offset: args.offset })),
 );
 
 server.registerTool(
   "list_spacex_launches",
   {
     description:
-      "List SpaceX launches from the secondary SpaceX REST API (upcoming by default). If it is unreachable, use list_upcoming_launches with provider_name='SpaceX' instead.",
+      "List SpaceX launches from the secondary SpaceX REST API (upcoming by default, server-side search/sort/pagination via /launches/query). If it is unreachable, use list_upcoming_launches with provider_name='SpaceX' instead.",
     inputSchema: {
       upcoming: z.boolean().optional().describe("True for upcoming, false for past (default true)."),
       search: z.string().optional().describe("Filter by mission name substring, e.g. 'Starlink'."),
       limit: limitParam,
+      offset: offsetParam,
     },
   },
   async (args) =>
-    asText(
-      await listSpaceXLaunches({ upcoming: args.upcoming, search: args.search, limit: args.limit }),
+    handle(() =>
+      listSpaceXLaunches({ upcoming: args.upcoming, search: args.search, limit: args.limit, offset: args.offset }),
     ),
 );
 
@@ -168,7 +200,43 @@ server.registerTool(
       id: z.string().describe("SpaceX launch id."),
     },
   },
-  async ({ id }) => asText(await getSpaceXLaunch(id)),
+  async ({ id }) => handle(() => getSpaceXLaunch(id)),
+);
+
+server.registerTool(
+  "list_rocketlaunch_live",
+  {
+    description:
+      "Fallback independente (RocketLaunch.Live, tier gratuito: próximos até 5 lançamentos, sem auth). Use quando Launch Library 2 estiver fora do ar; inclui janela/t0 e clima do pad.",
+    inputSchema: {
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(5)
+        .optional()
+        .describe("Max items to return (default 5, max 5 on the free tier)."),
+    },
+  },
+  async (args) => handle(() => listRocketLaunchLiveUpcoming({ limit: args.limit })),
+);
+
+server.registerTool(
+  "list_spaceflight_news",
+  {
+    description:
+      "Space news with launch context (Spaceflight News API v4, sem auth): articles, blogs ou reports. Complementa o manifesto com cobertura jornalística.",
+    inputSchema: {
+      type: z.enum(["article", "blog", "report"]).optional().describe("Kind of item (default 'article')."),
+      search: z.string().optional().describe("Free-text search, e.g. 'Starship', 'Artemis'."),
+      limit: limitParam,
+      offset: offsetParam,
+    },
+  },
+  async (args) =>
+    handle(() =>
+      listSpaceflightNews({ type: args.type, search: args.search, limit: args.limit, offset: args.offset }),
+    ),
 );
 
 await server.connect(new StdioServerTransport());
