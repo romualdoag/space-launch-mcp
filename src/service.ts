@@ -11,6 +11,14 @@
  */
 
 import { createRequire } from "node:module";
+import {
+  kvGet,
+  kvSet,
+  registryCacheTtlHours,
+  launchDetailCacheTtlHours,
+  isWindowInPast,
+  isPastLaunch,
+} from "./cache.js";
 
 export const LL2_BASE = "https://ll.thespacedevs.com/2.2.0";
 export const SPACEX_BASE = "https://api.spacexdata.com/v5";
@@ -522,6 +530,10 @@ type Paginated<T> = { count: number; next: string | null; results: T[] };
 
 async function resolveLocationIds(countryCode: string): Promise<number[]> {
   const code = validateCountryCode(countryCode);
+  // Registry quase estático → frio 30d antes do upstream.
+  const coldKey = `registry:location-ids:${code}`;
+  const cold = kvGet(coldKey, registryCacheTtlHours());
+  if (Array.isArray(cold) && cold.every((n) => typeof n === "number")) return cold as number[];
   // Pagina via `next` — países grandes (ex. USA) têm >100 locations.
   let url: string | null = `${LL2_BASE}/location/?country_code=${encodeURIComponent(code)}&limit=100`;
   const ids: number[] = [];
@@ -538,10 +550,14 @@ async function resolveLocationIds(countryCode: string): Promise<number[]> {
     }
     url = typeof data.next === "string" && data.next.length > 0 ? data.next : null;
   }
+  kvSet(coldKey, ids);
   return ids;
 }
 
 async function resolveProviderId(providerName: string): Promise<number> {
+  const coldKey = `registry:provider-id:${providerName.trim().toLowerCase()}`;
+  const cold = kvGet(coldKey, registryCacheTtlHours());
+  if (typeof cold === "number" && Number.isFinite(cold)) return cold;
   const url = `${LL2_BASE}/agencies/?search=${encodeURIComponent(providerName)}&limit=10`;
   const data = await fetchJson<Paginated<Record<string, unknown>>>(url, "LL2 agencies", 24 * 3_600_000);
   const results = Array.isArray(data.results) ? data.results : [];
@@ -551,7 +567,9 @@ async function resolveProviderId(providerName: string): Promise<number> {
       `Unknown provider '${providerName}'. Call list_launch_providers with search='${providerName}' to find the exact name.`,
     );
   }
-  return Number(best.id);
+  const id = Number(best.id);
+  kvSet(coldKey, id);
+  return id;
 }
 
 export async function listUpcomingLaunches(opts: UpcomingOptions = {}) {
@@ -587,6 +605,24 @@ export async function listUpcomingLaunches(opts: UpcomingOptions = {}) {
   const params = buildLaunchParams({ ...opts, mode }, resolved);
   const qs = new URLSearchParams(params).toString();
   const url = `${LL2_BASE}/launch/${mode}/?${qs}`;
+  // Janela toda no passado → listagem imutável → frio infinito.
+  // Upcoming/recente nunca vai pro frio: só o quente 60s.
+  if (isWindowInPast({ windowStartLte: opts.windowStartLte })) {
+    const coldKey = `launches:${url}`;
+    const cold = kvGet(coldKey, Number.POSITIVE_INFINITY);
+    if (cold !== undefined) {
+      return cold as { mode: UpcomingMode; count: number; results: SlimLaunch[]; note?: string };
+    }
+    const data = await fetchJson<Paginated<Record<string, unknown>>>(url, `LL2 ${mode} launches`, 60_000);
+    const out = {
+      mode,
+      count: typeof data.count === "number" ? data.count : 0,
+      results: Array.isArray(data.results) ? data.results.map(normalizeLaunch) : [],
+      ...(conflictNote ? { note: conflictNote } : {}),
+    };
+    kvSet(coldKey, out);
+    return out;
+  }
   const data = await fetchJson<Paginated<Record<string, unknown>>>(url, `LL2 ${mode} launches`, 60_000);
   const results = Array.isArray(data.results) ? data.results.map(normalizeLaunch) : [];
   return {
@@ -600,9 +636,15 @@ export async function listUpcomingLaunches(opts: UpcomingOptions = {}) {
 export async function getLaunch(id: string) {
   const clean = id.trim();
   if (!clean) throw new Error("get_launch requires a non-empty id (LL2 launch id or slug).");
+  // Detalhe passado é imutável na prática → frio 30d. Upcoming fica só no quente 60s.
+  const coldKey = `launch:${clean}`;
+  const cold = kvGet(coldKey, launchDetailCacheTtlHours());
+  if (cold !== undefined && typeof cold === "object" && cold !== null) return cold as SlimLaunch;
   const url = `${LL2_BASE}/launch/${encodeURIComponent(clean)}/`;
   const data = await fetchJson<Record<string, unknown>>(url, "LL2 launch detail", 60_000);
-  return normalizeLaunch(data);
+  const slim = normalizeLaunch(data);
+  if (isPastLaunch(slim)) kvSet(coldKey, slim);
+  return slim;
 }
 
 export async function listLaunchLocations(
@@ -615,13 +657,20 @@ export async function listLaunchLocations(
   if (opts.search) params.search = opts.search;
   if (opts.countryCode) params.country_code = validateCountryCode(opts.countryCode);
   const url = `${LL2_BASE}/location/?${new URLSearchParams(params).toString()}`;
+  const coldKey = `registry:${url}`;
+  const coldLocs = kvGet(coldKey, registryCacheTtlHours());
+  if (coldLocs !== undefined) {
+    return coldLocs as { count: number; offset: number; results: SlimLocation[] };
+  }
   const data = await fetchJson<Paginated<Record<string, unknown>>>(url, "LL2 locations", 24 * 3_600_000);
   const results = Array.isArray(data.results) ? data.results.map(normalizeLocation) : [];
-  return {
+  const out = {
     count: typeof data.count === "number" ? data.count : results.length,
     offset: clampOffset(opts.offset),
     results,
   };
+  kvSet(coldKey, out);
+  return out;
 }
 
 export async function listLaunchPads(
@@ -634,13 +683,20 @@ export async function listLaunchPads(
   if (opts.search) params.search = opts.search;
   if (opts.locationId !== undefined) params.location__ids = String(opts.locationId);
   const url = `${LL2_BASE}/pad/?${new URLSearchParams(params).toString()}`;
+  const coldKey = `registry:${url}`;
+  const coldPads = kvGet(coldKey, registryCacheTtlHours());
+  if (coldPads !== undefined) {
+    return coldPads as { count: number; offset: number; results: SlimPad[] };
+  }
   const data = await fetchJson<Paginated<Record<string, unknown>>>(url, "LL2 pads", 24 * 3_600_000);
   const results = Array.isArray(data.results) ? data.results.map(normalizePad) : [];
-  return {
+  const out = {
     count: typeof data.count === "number" ? data.count : results.length,
     offset: clampOffset(opts.offset),
     results,
   };
+  kvSet(coldKey, out);
+  return out;
 }
 
 export async function listLaunchProviders(opts: { search?: string; limit?: number; offset?: number } = {}) {
@@ -650,13 +706,20 @@ export async function listLaunchProviders(opts: { search?: string; limit?: numbe
   };
   if (opts.search) params.search = opts.search;
   const url = `${LL2_BASE}/agencies/?${new URLSearchParams(params).toString()}`;
+  const coldKey = `registry:${url}`;
+  const coldProvs = kvGet(coldKey, registryCacheTtlHours());
+  if (coldProvs !== undefined) {
+    return coldProvs as { count: number; offset: number; results: SlimProvider[] };
+  }
   const data = await fetchJson<Paginated<Record<string, unknown>>>(url, "LL2 agencies", 24 * 3_600_000);
   const results = Array.isArray(data.results) ? data.results.map(normalizeProvider) : [];
-  return {
+  const out = {
     count: typeof data.count === "number" ? data.count : results.length,
     offset: clampOffset(opts.offset),
     results,
   };
+  kvSet(coldKey, out);
+  return out;
 }
 
 // ---------------------------------------------------------------------------

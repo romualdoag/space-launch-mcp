@@ -14,6 +14,7 @@ import {
   listLaunchPads,
   listLaunchProviders,
 } from "../src/service.js";
+import { __resetColdCacheForTests } from "../src/cache.js";
 
 const RLL_FIXTURE = {
   valid_auth: false,
@@ -110,6 +111,7 @@ function stubFetch(handler: (url: string, init?: { method?: string; body?: strin
 }
 
 beforeEach(() => {
+  __resetColdCacheForTests(":memory:");
   __clearCache();
   __resetFetch();
 });
