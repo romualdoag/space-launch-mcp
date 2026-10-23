@@ -14,8 +14,11 @@ import { createRequire } from "node:module";
 import {
   kvGet,
   kvSet,
+  kvGetWithMeta,
+  kvTouch,
   registryCacheTtlHours,
   launchDetailCacheTtlHours,
+  launchDetailStaleExtraHours,
   isWindowInPast,
   isPastLaunch,
 } from "./cache.js";
@@ -128,6 +131,41 @@ export function __cacheSize(): number {
   return cache.size;
 }
 
+/**
+ * Canonicaliza uma URL pra uso como chave de cache:
+ * - host (e scheme) em minúsculas,
+ * - query params ordenados por nome e valor (ordem de construção não importa),
+ * - trailing slash removido (exceto raiz),
+ * - porta default (80/443) e fragmento descartados.
+ * Se não parsear como URL absoluta, devolve o input aparado.
+ */
+export function canonicalUrl(raw: string): string {
+  const t = raw.trim();
+  try {
+    const u = new URL(t);
+    u.protocol = u.protocol.toLowerCase();
+    u.hostname = u.hostname.toLowerCase();
+    if ((u.protocol === "https:" && u.port === "443") || (u.protocol === "http:" && u.port === "80")) {
+      u.port = "";
+    }
+    if (u.pathname.length > 1) u.pathname = u.pathname.replace(/\/+$/, "") || "/";
+    const entries = [...u.searchParams.entries()].sort((a, b) =>
+      a[0] === b[0] ? (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0) : a[0] < b[0] ? -1 : 1,
+    );
+    u.search = "";
+    for (const [k, v] of entries) u.searchParams.append(k, v);
+    u.hash = "";
+    return u.toString();
+  } catch {
+    return t;
+  }
+}
+
+/** Chave do cache quente: método em maiúsculas + URL canônica + corpo. */
+export function buildHotCacheKey(url: string, method?: string, body?: string): string {
+  return `${(method ?? "GET").trim().toUpperCase()} ${canonicalUrl(url)} ${body ?? ""}`;
+}
+
 /** Clear the response cache (used by unit tests). */
 export function __clearCache(): void {
   cache.clear();
@@ -173,8 +211,19 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status === 502 || status === 503 || status === 504;
 }
 
-async function fetchJson<T>(url: string, label: string, ttlMs: number, init?: { method?: string; body?: string }): Promise<T> {
-  const key = `${init?.method ?? "GET"} ${url} ${init?.body ?? ""}`;
+async function fetchJson<T>(
+  url: string,
+  label: string,
+  ttlMs: number,
+  init?: {
+    method?: string;
+    body?: string;
+    headers?: Record<string, string>;
+    /** Chamado no sucesso com os validadores de cache da resposta (ETag/Last-Modified). */
+    onMeta?: (meta: { etag: string | null; lastModified: string | null }) => void;
+  },
+): Promise<T> {
+  const key = buildHotCacheKey(url, init?.method, init?.body);
   const now = Date.now();
   const hit = cacheGet(key);
   if (hit && hit.expires > now) return hit.data as T;
@@ -186,7 +235,7 @@ async function fetchJson<T>(url: string, label: string, ttlMs: number, init?: { 
     try {
       const resp = await fetchFn(url, {
         method: init?.method,
-        headers: init?.body ? { "content-type": "application/json" } : undefined,
+        headers: { ...(init?.body ? { "content-type": "application/json" } : {}), ...(init?.headers ?? {}) },
         body: init?.body,
         signal: ctrl.signal,
       });
@@ -199,6 +248,10 @@ async function fetchJson<T>(url: string, label: string, ttlMs: number, init?: { 
       if (!resp.ok) {
         throw new Error(`${label}: HTTP ${resp.status} for ${url}`);
       }
+      init?.onMeta?.({
+        etag: getHeader(resp.headers, "etag"),
+        lastModified: getHeader(resp.headers, "last-modified"),
+      });
       const data = (await resp.json()) as T;
       cacheSet(key, { expires: Date.now() + ttlMs, data });
       return data;
@@ -215,6 +268,16 @@ async function fetchJson<T>(url: string, label: string, ttlMs: number, init?: { 
     }
   }
   throw lastError instanceof Error ? lastError : new Error(`${label}: request failed for ${url}`);
+}
+
+/** Test hook: acesso direto ao fetchJson (quente canônico) pra testes de chave. */
+export function __fetchJsonForTests<T>(
+  url: string,
+  label: string,
+  ttlMs: number,
+  init?: { method?: string; body?: string },
+): Promise<T> {
+  return fetchJson<T>(url, label, ttlMs, init);
 }
 
 // ---------------------------------------------------------------------------
@@ -608,7 +671,7 @@ export async function listUpcomingLaunches(opts: UpcomingOptions = {}) {
   // Janela toda no passado → listagem imutável → frio infinito.
   // Upcoming/recente nunca vai pro frio: só o quente 60s.
   if (isWindowInPast({ windowStartLte: opts.windowStartLte })) {
-    const coldKey = `launches:${url}`;
+    const coldKey = `launches:${canonicalUrl(url)}`;
     const cold = kvGet(coldKey, Number.POSITIVE_INFINITY);
     if (cold !== undefined) {
       return cold as { mode: UpcomingMode; count: number; results: SlimLaunch[]; note?: string };
@@ -636,15 +699,97 @@ export async function listUpcomingLaunches(opts: UpcomingOptions = {}) {
 export async function getLaunch(id: string) {
   const clean = id.trim();
   if (!clean) throw new Error("get_launch requires a non-empty id (LL2 launch id or slug).");
-  // Detalhe passado é imutável na prática → frio 30d. Upcoming fica só no quente 60s.
+  // Detalhe passado é imutável na prática → frio 30d + revalidação ocasional.
+  // Upcoming fica só no quente 60s. Chave fria é `v1:…` com fallback legado.
   const coldKey = `launch:${clean}`;
-  const cold = kvGet(coldKey, launchDetailCacheTtlHours());
-  if (cold !== undefined && typeof cold === "object" && cold !== null) return cold as SlimLaunch;
+  const ttlMs = launchDetailCacheTtlHours() * 3_600_000;
+  const meta = kvGetWithMeta(coldKey);
+  if (meta !== undefined && typeof meta.value === "object" && meta.value !== null) {
+    const cached = meta.value as SlimLaunch;
+    const fresh = !Number.isFinite(ttlMs) || meta.ageMs <= ttlMs;
+    if (fresh) {
+      // Migração silenciosa: hit legado é reescrito sob `v1:…`.
+      if (meta.legacy) kvSet(coldKey, cached, { etag: meta.etag, lastModified: meta.lastModified });
+      return cached;
+    }
+    const staleExtraMs = launchDetailStaleExtraHours() * 3_600_000;
+    if (Number.isFinite(ttlMs) && meta.ageMs <= ttlMs + staleExtraMs) {
+      return await revalidatePastLaunch(coldKey, clean, cached, {
+        etag: meta.etag,
+        lastModified: meta.lastModified,
+      });
+    }
+    // Velho além da janela stale: refetch integral abaixo.
+  }
   const url = `${LL2_BASE}/launch/${encodeURIComponent(clean)}/`;
-  const data = await fetchJson<Record<string, unknown>>(url, "LL2 launch detail", 60_000);
+  let etag: string | null = null;
+  let lastModified: string | null = null;
+  const data = await fetchJson<Record<string, unknown>>(url, "LL2 launch detail", 60_000, {
+    onMeta: (m) => {
+      etag = m.etag;
+      lastModified = m.lastModified;
+    },
+  });
   const slim = normalizeLaunch(data);
-  if (isPastLaunch(slim)) kvSet(coldKey, slim);
+  if (isPastLaunch(slim)) kvSet(coldKey, slim, { etag, lastModified });
   return slim;
+}
+
+/**
+ * Revalidação barata e ocasional de detalhe passado com idade > TTL:
+ * - com ETag/Last-Modified → 1 GET condicional (304 mantém o cache, 200 atualiza);
+ * - sem validadores → TTL estendido sem rede (dado passado é quase imutável);
+ * - qualquer falha → fail-soft, serve o cache e estende pra não martelar.
+ */
+async function revalidatePastLaunch(
+  coldKey: string,
+  clean: string,
+  cached: SlimLaunch,
+  validators: { etag: string | null; lastModified: string | null },
+): Promise<SlimLaunch> {
+  if (!validators.etag && !validators.lastModified) {
+    kvTouch(coldKey);
+    return cached;
+  }
+  const url = `${LL2_BASE}/launch/${encodeURIComponent(clean)}/`;
+  const timeoutMs = getTimeoutMs();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const headers: Record<string, string> = {};
+    if (validators.etag) headers["if-none-match"] = validators.etag;
+    if (validators.lastModified) headers["if-modified-since"] = validators.lastModified;
+    const resp = await fetchFn(url, { headers, signal: ctrl.signal });
+    if (resp.status === 304) {
+      kvTouch(coldKey);
+      return cached;
+    }
+    if (resp.ok) {
+      const data = (await resp.json()) as Record<string, unknown>;
+      const slim = normalizeLaunch(data);
+      kvSet(coldKey, slim, {
+        etag: getHeader(resp.headers, "etag"),
+        lastModified: getHeader(resp.headers, "last-modified"),
+      });
+      return slim;
+    }
+    warn(`LL2 launch detail: revalidação HTTP ${resp.status} p/ ${clean} — serve cache`);
+    kvTouch(coldKey);
+    return cached;
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      warn(`LL2 launch detail: revalidação timeout após ${timeoutMs}ms p/ ${clean} — serve cache`);
+    }
+    // Fail-soft com backoff: estende o TTL pra próxima tentativa não ser imediata.
+    try {
+      kvTouch(coldKey);
+    } catch {
+      /* ignore */
+    }
+    return cached;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function listLaunchLocations(
@@ -657,7 +802,7 @@ export async function listLaunchLocations(
   if (opts.search) params.search = opts.search;
   if (opts.countryCode) params.country_code = validateCountryCode(opts.countryCode);
   const url = `${LL2_BASE}/location/?${new URLSearchParams(params).toString()}`;
-  const coldKey = `registry:${url}`;
+  const coldKey = `registry:${canonicalUrl(url)}`;
   const coldLocs = kvGet(coldKey, registryCacheTtlHours());
   if (coldLocs !== undefined) {
     return coldLocs as { count: number; offset: number; results: SlimLocation[] };
@@ -683,7 +828,7 @@ export async function listLaunchPads(
   if (opts.search) params.search = opts.search;
   if (opts.locationId !== undefined) params.location__ids = String(opts.locationId);
   const url = `${LL2_BASE}/pad/?${new URLSearchParams(params).toString()}`;
-  const coldKey = `registry:${url}`;
+  const coldKey = `registry:${canonicalUrl(url)}`;
   const coldPads = kvGet(coldKey, registryCacheTtlHours());
   if (coldPads !== undefined) {
     return coldPads as { count: number; offset: number; results: SlimPad[] };
@@ -706,7 +851,7 @@ export async function listLaunchProviders(opts: { search?: string; limit?: numbe
   };
   if (opts.search) params.search = opts.search;
   const url = `${LL2_BASE}/agencies/?${new URLSearchParams(params).toString()}`;
-  const coldKey = `registry:${url}`;
+  const coldKey = `registry:${canonicalUrl(url)}`;
   const coldProvs = kvGet(coldKey, registryCacheTtlHours());
   if (coldProvs !== undefined) {
     return coldProvs as { count: number; offset: number; results: SlimProvider[] };
