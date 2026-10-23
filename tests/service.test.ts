@@ -22,6 +22,7 @@ import {
   listSpaceXLaunches,
   getSpaceXLaunch,
 } from "../src/service.js";
+import { __resetColdCacheForTests } from "../src/cache.js";
 
 const LAUNCH_FIXTURE = {
   count: 2,
@@ -137,6 +138,7 @@ function stubFetch(handler: (url: string) => unknown) {
 }
 
 beforeEach(() => {
+  __resetColdCacheForTests(":memory:");
   __clearCache();
   __resetFetch();
 });
